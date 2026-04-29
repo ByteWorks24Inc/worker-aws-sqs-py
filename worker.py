@@ -5,12 +5,19 @@ import requests
 import time
 import os
 import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import signal
+import sys
 
 QUEUE_URL = "*"
-BACKEND_RESULT_URL = "http://*:8080/api/result"
-WORK_DIR = "/tmp/qnx_jobs"
-HEALTH_PORT = 5050
+
+BACKEND_BASE_URL      = "https://bitlab.utej.me"
+BACKEND_RESULT_URL    = f"{BACKEND_BASE_URL}/api/result"
+BACKEND_HEARTBEAT_URL = f"{BACKEND_BASE_URL}/api/worker/qnx/heartbeat"
+BACKEND_CONNECT_URL   = f"{BACKEND_BASE_URL}/api/worker/qnx/connect"
+BACKEND_DISCONNECT_URL= f"{BACKEND_BASE_URL}/api/worker/qnx/disconnect"
+
+WORK_DIR           = "/tmp/qnx_jobs"
+HEARTBEAT_INTERVAL = 15   # seconds — also acts as crash-detection window on backend
 
 os.makedirs(WORK_DIR, exist_ok=True)
 
@@ -23,36 +30,39 @@ sqs = boto3.client(
 
 
 # ─────────────────────────────────────────────
-# Lightweight health-check HTTP server (port 5050)
-# The Java backend pings GET /health to detect
-# whether this worker is online.
+# Signal: notify backend immediately on
+# clean shutdown (Ctrl+C, kill, systemd stop)
 # ─────────────────────────────────────────────
 
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == "/health":
-            body = b'{"status":"ok","worker":"qnx"}'
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-        else:
-            self.send_response(404)
-            self.end_headers()
+def on_shutdown(signum, frame):
+    print("\n[worker] Shutting down — notifying backend...")
+    try:
+        requests.post(BACKEND_DISCONNECT_URL, timeout=5)
+        print("[worker] Backend notified: OFFLINE")
+    except Exception as e:
+        print(f"[worker] Could not notify backend: {e}")
+    sys.exit(0)
 
-    def log_message(self, format, *args):
-        pass  # Suppress default access logs
+signal.signal(signal.SIGINT,  on_shutdown)
+signal.signal(signal.SIGTERM, on_shutdown)
 
 
-def start_health_server():
-    server = HTTPServer(("0.0.0.0", HEALTH_PORT), HealthHandler)
-    print(f"Health server listening on port {HEALTH_PORT}")
-    server.serve_forever()
+# ─────────────────────────────────────────────
+# Heartbeat thread — periodic liveness ping
+# (also covers crash/kill where on_shutdown
+#  doesn't run — backend times out after 30s)
+# ─────────────────────────────────────────────
 
+def heartbeat_loop():
+    while True:
+        try:
+            r = requests.post(BACKEND_HEARTBEAT_URL, timeout=5)
+            print(f"[heartbeat] {r.status_code}")
+        except Exception as e:
+            print(f"[heartbeat] failed: {e}")
+        time.sleep(HEARTBEAT_INTERVAL)
 
-# Start health server in a background daemon thread
-threading.Thread(target=start_health_server, daemon=True).start()
+threading.Thread(target=heartbeat_loop, daemon=True).start()
 
 
 # ─────────────────────────────────────────────
@@ -63,23 +73,19 @@ def execute_qnx(code, job_id):
     file_path = f"{WORK_DIR}/{job_id}.c"
     with open(file_path, "w") as f:
         f.write(code)
-
     try:
         result = subprocess.run(
             ["/home/utej/backend/scripts/run_qnx.sh", file_path],
-            capture_output=True,
-            text=True,
-            timeout=30
+            capture_output=True, text=True, timeout=30
         )
         logs = result.stdout + "\n" + result.stderr
     except Exception as e:
         logs = str(e)
-
     return logs
 
 
 # ─────────────────────────────────────────────
-# Purge queue before starting
+# Startup sequence
 # ─────────────────────────────────────────────
 
 print("Purging SQS queue before starting worker...")
@@ -89,6 +95,13 @@ try:
     time.sleep(5)
 except Exception as e:
     print("Queue purge failed:", e)
+
+# Notify backend immediately that worker is ONLINE
+try:
+    requests.post(BACKEND_CONNECT_URL, timeout=5)
+    print("[worker] Backend notified: ONLINE")
+except Exception as e:
+    print(f"[worker] Could not notify backend on startup: {e}")
 
 print("Worker started. Waiting for jobs...")
 
@@ -109,29 +122,23 @@ while True:
         if not messages:
             continue
 
-        msg = messages[0]
+        msg  = messages[0]
         body = json.loads(msg["Body"])
         job_id = body["jobId"]
-        code = body["code"]
+        code   = body["code"]
 
         print("Running job:", job_id)
         logs = execute_qnx(code, job_id)
         print("Execution finished")
 
         try:
-            requests.post(
-                BACKEND_RESULT_URL,
-                json={"jobId": job_id, "logs": logs},
-                timeout=10
-            )
+            requests.post(BACKEND_RESULT_URL,
+                          json={"jobId": job_id, "logs": logs}, timeout=10)
         except Exception as e:
             print("Failed sending result:", e)
 
-        sqs.delete_message(
-            QueueUrl=QUEUE_URL,
-            ReceiptHandle=msg["ReceiptHandle"]
-        )
-
+        sqs.delete_message(QueueUrl=QUEUE_URL,
+                           ReceiptHandle=msg["ReceiptHandle"])
         print("Job completed:", job_id)
 
     except Exception as e:
