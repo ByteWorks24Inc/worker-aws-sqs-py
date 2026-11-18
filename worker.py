@@ -1,5 +1,3 @@
-//fix ssh
-
 import boto3
 import json
 import subprocess
@@ -27,9 +25,7 @@ os.makedirs(WORK_DIR, exist_ok=True)
 
 sqs = boto3.client(
     "sqs",
-    region_name="us-east-2",
-    aws_access_key_id="*",
-    aws_secret_access_key="*"
+    region_name=os.environ.get("AWS_REGION", "us-east-2"),
 )
 
 
