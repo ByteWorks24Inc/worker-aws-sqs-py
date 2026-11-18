@@ -9,16 +9,18 @@ import os
 import threading
 import signal
 import sys
+import tempfile
 
-QUEUE_URL = "*"
+QUEUE_URL = os.environ.get("SQS_QUEUE_URL", "*")
 
-BACKEND_BASE_URL      = "https://bitlab.utej.me"
+BACKEND_BASE_URL      = os.environ.get("BACKEND_BASE_URL", "https://bitlab.utej.me").rstrip("/")
 BACKEND_RESULT_URL    = f"{BACKEND_BASE_URL}/api/result"
 BACKEND_HEARTBEAT_URL = f"{BACKEND_BASE_URL}/api/worker/qnx/heartbeat"
 BACKEND_CONNECT_URL   = f"{BACKEND_BASE_URL}/api/worker/qnx/connect"
 BACKEND_DISCONNECT_URL= f"{BACKEND_BASE_URL}/api/worker/qnx/disconnect"
 
-WORK_DIR           = "/tmp/qnx_jobs"
+WORK_DIR           = os.environ.get("QNX_WORK_DIR", os.path.join(tempfile.gettempdir(), "qnx_jobs"))
+QNX_RUN_SCRIPT     = os.environ.get("QNX_RUN_SCRIPT", "/home/utej/backend/scripts/run_qnx.sh")
 HEARTBEAT_INTERVAL = 15   # seconds — also acts as crash-detection window on backend
 
 os.makedirs(WORK_DIR, exist_ok=True)
@@ -77,7 +79,7 @@ def execute_qnx(code, job_id):
         f.write(code)
     try:
         result = subprocess.run(
-            ["/home/utej/backend/scripts/run_qnx.sh", file_path],
+            [QNX_RUN_SCRIPT, file_path],
             capture_output=True, text=True, timeout=30
         )
         logs = result.stdout + "\n" + result.stderr
